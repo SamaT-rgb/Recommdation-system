@@ -1,0 +1,163 @@
+import streamlit as st
+import pandas as pd
+import pickle
+import asyncio
+import aiohttp
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+import requests
+
+# Load environment variables
+load_dotenv()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Base URLs
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w300"
+
+# Initialize Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-pro")
+
+
+# ------------------------ API Check ------------------------
+def check_api_status():
+    try:
+        url = f"{TMDB_BASE_URL}/configuration?api_key={TMDB_API_KEY}"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            st.success("✅ TMDb API is reachable.")
+            return True
+        else:
+            st.error(f"❌ TMDb API Error: {response.status_code}")
+            return False
+    except Exception as e:
+        st.error("❌ Exception during API check:")
+        st.code(str(e))
+        return False
+
+
+# --------------------- Fetch Movie Details ---------------------
+async def fetch_movie_details(session, movie_id):
+    url = f"{TMDB_BASE_URL}/movie/{movie_id}?api_key={TMDB_API_KEY}&language=en-US"
+    try:
+        async with session.get(url, timeout=10) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+            return {
+                'title': data.get('title', 'N/A'),
+                'overview': data.get('overview', 'No overview available.'),
+                'release_date': data.get('release_date', 'N/A'),
+                'poster': IMAGE_BASE_URL + data['poster_path'] if data.get('poster_path') else None,
+                'json_data': data
+            }
+    except Exception as e:
+        return None
+
+
+async def fetch_movies_concurrently(movie_ids):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_movie_details(session, movie_id) for movie_id in movie_ids]
+        return await asyncio.gather(*tasks)
+
+
+# --------------------- Gemini Summary ---------------------
+def generate_summary_from_json(movie_json):
+    try:
+        prompt = f"""Given the following movie JSON data, write a short, engaging summary for users:
+{movie_json}"""
+
+        # Log the prompt being sent to the API
+        st.write("Sending prompt to Gemini API:", prompt)
+
+        response = model.generate_content(prompt)
+
+        # Log the raw response from Gemini
+        st.write("Gemini API response:", response)
+
+        # Check if the response is empty
+        if not response.text.strip():
+            st.warning("The AI summary is empty. Please check the response.")
+
+        return response.text.strip()
+
+    except Exception as e:
+        st.error(f"Error generating summary: {str(e)}")
+        return "Summary could not be generated."
+
+
+# --------------------- Recommendation Logic ---------------------
+def recommend(movie):
+    try:
+        movie_index = movies[movies['title'] == movie].index[0]
+        distances = similarity[movie_index]
+        sorted_movies = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])[1:6]
+        movie_ids = [movies.iloc[i[0]].movie_id for i in sorted_movies]
+        return asyncio.run(fetch_movies_concurrently(movie_ids))
+    except Exception as e:
+        st.error("Error during recommendation:")
+        st.code(str(e))
+        return []
+
+
+# ------------------------ Load Data ------------------------
+try:
+    movies_dict = pickle.load(open('movie_dict.pkl', 'rb'))
+    movies = pd.DataFrame(movies_dict)
+    similarity = pickle.load(open('similarity.pkl', 'rb'))
+except Exception as e:
+    st.error("❌ Failed to load model or data files.")
+    st.code(str(e))
+    st.stop()
+
+# ------------------------ Streamlit UI ------------------------
+st.set_page_config(page_title="Movie Recommender", layout="wide")
+st.title("🎬 Movie Recommender System")
+
+if not check_api_status():
+    st.warning("You can continue, but results may be incomplete.")
+    if not st.checkbox("Continue anyway"):
+        st.stop()
+
+selected_movie_name = st.selectbox("🎥 Choose a movie:", movies['title'].values)
+
+if st.button("🎯 Recommend"):
+    with st.spinner("Fetching recommendations..."):
+        movie_details = recommend(selected_movie_name)
+        movie_details = [m for m in movie_details if m is not None]
+
+    if movie_details:
+        st.subheader(f"📽️ Recommendations for '{selected_movie_name}':")
+        cols = st.columns(5)
+        for idx, (col, details) in enumerate(zip(cols, movie_details)):
+            with col:
+                if details['poster']:
+                    st.image(details['poster'], use_column_width=True)
+                st.write(f"**{details['title']}**")
+                if st.button("📖 Details", key=f"details_{idx}"):
+                    st.session_state.detail_movie = details
+
+    if 'detail_movie' in st.session_state:
+        d = st.session_state.detail_movie
+        st.markdown("---")
+        st.subheader(f"🎬 More about *{d['title']}*")
+        st.image(d['poster'], width=200)
+        st.write(f"**Overview:** {d['overview']}")
+        st.write(f"**Release Date:** {d['release_date']}")
+
+        with st.spinner("Generating summary..."):
+            summary = generate_summary_from_json(d['json_data'])
+            st.markdown("📝 **AI Summary:**")
+            st.info(summary)
+
+        if st.button("🔙 Back to recommendations"):
+            st.session_state.pop("detail_movie")
+
+    elif len(movie_details) < 5:
+        st.warning("⚠️ Some recommendations couldn't be loaded.")
+
+    else:
+        st.success("✅ All recommendations loaded.")
